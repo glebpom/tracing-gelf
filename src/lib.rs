@@ -72,6 +72,7 @@ use bytes::Bytes;
 use futures_channel::mpsc;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{map::Map, Value};
+use std::sync::Arc;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time;
 use tokio_util::codec::{BytesCodec, FramedWrite};
@@ -118,6 +119,10 @@ pub enum BuilderError {
     OsString(std::ffi::OsString),
     /// Global dispatcher failed.
     Global(SetGlobalDefaultError),
+
+    /// DNS name error
+    #[cfg(feature = "tokio-rustls")]
+    Dns(tokio_rustls::webpki::InvalidDNSNameError),
 }
 
 /// A builder for [`Logger`](struct.Logger.html).
@@ -199,8 +204,41 @@ impl Builder {
         self
     }
 
-    /// Return `Logger` and TCP connection background task.
-    pub fn connect_tcp(self, addr: SocketAddr) -> Result<(Logger, BackgroundTask), BuilderError> {
+    /// Return `Logger` and TLS connection background task.
+    #[cfg(feature = "tokio-rustls")]
+    pub fn connect_tls(
+        self,
+        addr: SocketAddr,
+        domain_name: String,
+        client_config: Arc<tokio_rustls::rustls::ClientConfig>,
+    ) -> Result<(Logger, BackgroundTask), BuilderError> {
+        let dnsname = tokio_rustls::webpki::DNSNameRef::try_from_ascii_str(&domain_name)
+            .map_err(BuilderError::Dns)?
+            .to_owned();
+
+        self.connect_tcp_with_wrapper(addr, {
+            move |s| {
+                let dnsname = dnsname.clone();
+                let client_config = client_config.clone();
+
+                async move {
+                    let config = tokio_rustls::TlsConnector::from(client_config);
+                    config.connect(dnsname.as_ref(), s).await
+                }
+            }
+        })
+    }
+
+    fn connect_tcp_with_wrapper<F, R, S>(
+        self,
+        addr: SocketAddr,
+        f: F,
+    ) -> Result<(Logger, BackgroundTask), BuilderError>
+    where
+        F: FnMut(TcpStream) -> R + Send + Sync + Clone + 'static,
+        R: Future<Output = Result<S, std::io::Error>> + Send,
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send,
+    {
         // Persistent fields
         let mut base_object = self.additional_fields;
 
@@ -227,18 +265,34 @@ impl Builder {
             // Reconnection loop
             loop {
                 // Try connect
-                let mut tcp_stream = match TcpStream::connect(addr).await {
+
+                let mut f = f.clone();
+
+                let try_connect = async move {
+                    let tcp = TcpStream::connect(addr).await?;
+                    (f)(tcp).await
+                };
+
+                let try_connect_result = try_connect.await;
+
+                println!("{:?}", try_connect_result.as_ref().err());
+
+                let tcp_stream = match try_connect_result {
                     Ok(ok) => ok,
-                    Err(_) => {
+                    Err(e) => {
+                        println!("err connecting {:?}", e);
+
                         time::delay_for(time::Duration::from_millis(timeout_ms as u64)).await;
                         continue;
                     }
                 };
 
                 // Writer
-                let (_, writer) = tcp_stream.split();
+                let (_, writer) = tokio::io::split(tcp_stream);
                 let mut sink = FramedWrite::new(writer, BytesCodec::new());
                 if let Err(_err) = sink.send_all(&mut ok_receiver).await {
+                    println!("err on send_all {:?}", _err);
+
                     // TODO: Add handler
                 };
             }
@@ -254,6 +308,11 @@ impl Builder {
         };
 
         Ok((logger, bg_task))
+    }
+
+    /// Return `Logger` and TCP connection background task.
+    fn connect_tcp(self, addr: SocketAddr) -> Result<(Logger, BackgroundTask), BuilderError> {
+        self.connect_tcp_with_wrapper(addr, |s| async { Ok(s) })
     }
 
     /// Initialize logging with a given `Subscriber` and return TCP connection background task.
@@ -278,9 +337,43 @@ impl Builder {
         Ok(bg_task)
     }
 
+    /// Initialize logging with a given `Subscriber` and return TCP connection background task.
+    pub fn init_tls_with_subscriber<S>(
+        self,
+        addr: SocketAddr,
+        domain_name: String,
+        client_config: Arc<tokio_rustls::rustls::ClientConfig>,
+        subscriber: S,
+    ) -> Result<BackgroundTask, BuilderError>
+    where
+        S: Subscriber + for<'a> LookupSpan<'a>,
+        S: Send + Sync + 'static,
+    {
+        let (logger, bg_task) = self.connect_tls(addr, domain_name, client_config)?;
+
+        // If a subscriber was set then use it as the inner subscriber.
+        let subscriber = logger.with_subscriber(subscriber);
+        tracing_core::dispatcher::set_global_default(tracing_core::dispatcher::Dispatch::new(
+            subscriber,
+        ))
+        .map_err(BuilderError::Global)?;
+
+        Ok(bg_task)
+    }
+
     /// Initialize logging and return TCP connection background task.
     pub fn init_tcp(self, addr: SocketAddr) -> Result<BackgroundTask, BuilderError> {
         self.init_tcp_with_subscriber(addr, Registry::default())
+    }
+
+    /// Initialize logging and return TCP connection background task.
+    pub fn init_tls(
+        self,
+        addr: SocketAddr,
+        domain_name: String,
+        client_config: Arc<tokio_rustls::rustls::ClientConfig>,
+    ) -> Result<BackgroundTask, BuilderError> {
+        self.init_tls_with_subscriber(addr, domain_name, client_config, Registry::default())
     }
 
     /// Return `Logger` layer and a UDP connection background task.
