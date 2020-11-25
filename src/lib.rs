@@ -275,13 +275,9 @@ impl Builder {
 
                 let try_connect_result = try_connect.await;
 
-                println!("{:?}", try_connect_result.as_ref().err());
-
                 let tcp_stream = match try_connect_result {
                     Ok(ok) => ok,
                     Err(e) => {
-                        println!("err connecting {:?}", e);
-
                         time::delay_for(time::Duration::from_millis(timeout_ms as u64)).await;
                         continue;
                     }
@@ -291,8 +287,6 @@ impl Builder {
                 let (_, writer) = tokio::io::split(tcp_stream);
                 let mut sink = FramedWrite::new(writer, BytesCodec::new());
                 if let Err(_err) = sink.send_all(&mut ok_receiver).await {
-                    println!("err on send_all {:?}", _err);
-
                     // TODO: Add handler
                 };
             }
