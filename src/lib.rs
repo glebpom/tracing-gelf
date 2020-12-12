@@ -277,7 +277,7 @@ impl Builder {
 
                 let tcp_stream = match try_connect_result {
                     Ok(ok) => ok,
-                    Err(e) => {
+                    Err(_e) => {
                         time::delay_for(time::Duration::from_millis(timeout_ms as u64)).await;
                         continue;
                     }
