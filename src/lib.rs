@@ -72,11 +72,9 @@ use bytes::Bytes;
 use futures_channel::mpsc;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{map::Map, Value};
-use std::sync::Arc;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time;
 use tokio_util::codec::{BytesCodec, FramedWrite};
-use tokio_util::udp::UdpFramed;
 use tracing_core::dispatcher::SetGlobalDefaultError;
 use tracing_core::{
     span::{Attributes, Id, Record},
@@ -210,7 +208,7 @@ impl Builder {
         self,
         addr: SocketAddr,
         domain_name: String,
-        client_config: Arc<tokio_rustls::rustls::ClientConfig>,
+        client_config: std::sync::Arc<tokio_rustls::rustls::ClientConfig>,
     ) -> Result<(Logger, BackgroundTask), BuilderError> {
         let dnsname = tokio_rustls::webpki::DNSNameRef::try_from_ascii_str(&domain_name)
             .map_err(BuilderError::Dns)?
@@ -278,7 +276,7 @@ impl Builder {
                 let tcp_stream = match try_connect_result {
                     Ok(ok) => ok,
                     Err(_e) => {
-                        time::delay_for(time::Duration::from_millis(timeout_ms as u64)).await;
+                        time::sleep(time::Duration::from_millis(timeout_ms as u64)).await;
                         continue;
                     }
                 };
@@ -332,11 +330,12 @@ impl Builder {
     }
 
     /// Initialize logging with a given `Subscriber` and return TCP connection background task.
+    #[cfg(feature = "tokio-rustls")]
     pub fn init_tls_with_subscriber<S>(
         self,
         addr: SocketAddr,
         domain_name: String,
-        client_config: Arc<tokio_rustls::rustls::ClientConfig>,
+        client_config: std::sync::Arc<tokio_rustls::rustls::ClientConfig>,
         subscriber: S,
     ) -> Result<BackgroundTask, BuilderError>
     where
@@ -361,11 +360,12 @@ impl Builder {
     }
 
     /// Initialize logging and return TCP connection background task.
+    #[cfg(feature = "tokio-rustls")]
     pub fn init_tls(
         self,
         addr: SocketAddr,
         domain_name: String,
-        client_config: Arc<tokio_rustls::rustls::ClientConfig>,
+        client_config: std::sync::Arc<tokio_rustls::rustls::ClientConfig>,
     ) -> Result<BackgroundTask, BuilderError> {
         self.init_tls_with_subscriber(addr, domain_name, client_config, Registry::default())
     }
@@ -408,13 +408,13 @@ impl Builder {
                 let udp_socket = match UdpSocket::bind(bind_addr).await {
                     Ok(ok) => ok,
                     Err(_) => {
-                        time::delay_for(time::Duration::from_millis(timeout_ms as u64)).await;
+                        time::sleep(time::Duration::from_millis(timeout_ms as u64)).await;
                         continue;
                     }
                 };
 
                 // Writer
-                let udp_stream = UdpFramed::new(udp_socket, BytesCodec::new());
+                let udp_stream = tokio_util::udp::UdpFramed::new(udp_socket, BytesCodec::new());
                 let (mut sink, _) = udp_stream.split();
                 if let Err(_err) = sink.send_all(&mut ok_receiver).await {
                     // TODO: Add handler
